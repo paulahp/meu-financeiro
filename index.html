@@ -179,36 +179,101 @@ initYearSelectors();
 // ── PDF EXTRACTION ───────────────────────────────────────
 pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-async function extractTransactions(pdfData){
-  const pdf=await pdfjsLib.getDocument({data:pdfData}).promise;
-  const DATE_RE=/^\d{1,2}\s+de\s+\w+\.?\s*\d{4}$/i, AMT_RE=/^[+\-]?\s*R\$\s*[\d.,]+$/;
-  const txs=[], seen=new Set();
-  for(let p=1;p<=pdf.numPages;p++){
-    const page=await pdf.getPage(p), content=await page.getTextContent();
-    const byY={};
-    for(const item of content.items){ const t=item.str.trim(); if(!t)continue; const y=Math.round(item.transform[5]); if(!byY[y])byY[y]=[]; byY[y].push({x:item.transform[4],text:t}); }
-    const rows=Object.keys(byY).map(Number).sort((a,b)=>b-a).map(y=>({y,items:byY[y].sort((a,b)=>a.x-b.x)}));
-    for(const row of rows){
-      if(!DATE_RE.test(row.items[0]?.text))continue;
-      const amtItem=row.items.find(i=>i.x>350&&(AMT_RE.test(i.text)||i.text.startsWith('+ R$'))); if(!amtItem)continue;
-      const date=row.items[0].text;
-      const desc=row.items.filter(i=>i.x>50&&i.x<340&&i.text!=='-').map(i=>i.text).join(' ').trim(); if(!desc)continue;
-      const isCredit=amtItem.text.startsWith('+');
-      const val=parseBRL(amtItem.text.replace(/[^0-9.,]/g,'')); if(!val)continue;
-      const key=date+desc+amtItem.text; if(seen.has(key))continue; seen.add(key);
-      txs.push({date,desc,category:isCredit?'💳 Pagamento':categorize(desc),amount:isCredit?val:-val,isCredit});
+const PT_MONTHS={jan:1,fev:2,mar:3,abr:4,mai:5,jun:6,jul:7,ago:8,set:9,out:10,nov:11,dez:12,janeiro:1,fevereiro:2,marco:3,abril:4,maio:5,junho:6,julho:7,agosto:8,setembro:9,outubro:10,novembro:11,dezembro:12};
+const stripAccents=s=>s.normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+function isFullDate(s){
+  s=stripAccents(s.toLowerCase().trim());
+  if(/^\d{1,2}\/\d{1,2}(\/\d{2,4})?$/.test(s))return true;
+  const m=s.match(/^(\d{1,2})\s+(?:de\s+)?([a-z]{3,9})\.?(?:\s+(?:de\s+)?\d{4})?$/);
+  return !!(m&&PT_MONTHS[m[2]]);
+}
+// A data pode vir inteira num item só ("12 de abr. 2025") ou quebrada em vários
+function matchRowDate(items){
+  for(let n=Math.min(items.length,5);n>=1;n--){
+    const s=items.slice(0,n).map(i=>i.text).join(' ').replace(/\s+/g,' ').trim();
+    if(isFullDate(s))return{text:s,end:n};
+  }
+  return null;
+}
+const AMT_FULL=/^[+\-]?\s*R\$\s*[\d.]*\d,?\d*$/, AMT_RS=/^[+\-]?\s*R\$$/, AMT_NUM=/^[\d.]+,\d{2}$/;
+// O valor é o item mais à direita no formato R$; "R$" e o número podem vir separados
+function matchRowAmount(items,from){
+  for(let i=items.length-1;i>=from;i--){
+    const t=items[i].text;
+    if(AMT_FULL.test(t)&&/\d/.test(t)){
+      let start=i,sign='';
+      if(i>from&&/^[+\-]$/.test(items[i-1].text)){sign=items[i-1].text;start=i-1;}
+      return{text:(sign+' '+t).trim(),start};
+    }
+    if(AMT_NUM.test(t)&&i>from&&AMT_RS.test(items[i-1].text)){
+      let start=i-1,sign='';
+      if(start>from&&/^[+\-]$/.test(items[start-1].text)){sign=items[start-1].text;start--;}
+      return{text:(sign+' '+items[i-1].text+' '+t).trim(),start};
     }
   }
+  return null;
+}
+// Agrupa itens em linhas com tolerância de Y (itens da mesma linha nem sempre têm Y idêntico)
+function groupRows(items){
+  const pts=[];
+  for(const it of items){ const t=it.str.trim(); if(!t)continue; pts.push({x:it.transform[4],y:it.transform[5],text:t}); }
+  pts.sort((a,b)=>b.y-a.y||a.x-b.x);
+  const rows=[];
+  for(const p of pts){
+    const last=rows[rows.length-1];
+    if(last&&Math.abs(last.y-p.y)<=2.5)last.items.push(p);
+    else rows.push({y:p.y,items:[p]});
+  }
+  rows.forEach(r=>r.items.sort((a,b)=>a.x-b.x));
+  return rows;
+}
+async function openPdf(buf){
+  let password;
+  while(true){
+    try{ return await pdfjsLib.getDocument({data:new Uint8Array(buf.slice(0)),password}).promise; }
+    catch(e){
+      if(e&&e.name==='PasswordException'){
+        password=prompt(password===undefined
+          ?'🔒 Este PDF é protegido por senha.\nDigite a senha da fatura (o Inter costuma usar dígitos do seu CPF — veja o e-mail da fatura):'
+          :'❌ Senha incorreta. Digite novamente:');
+        if(!password)throw new Error('Este PDF é protegido por senha — informe a senha para importar.');
+      }
+      else if(e&&e.name==='InvalidPDFException')throw new Error('O arquivo não parece ser um PDF válido.');
+      else throw e;
+    }
+  }
+}
+async function extractTransactions(buf){
+  const pdf=await openPdf(buf);
+  const txs=[], seen=new Set(), debugRows=[];
+  for(let p=1;p<=pdf.numPages;p++){
+    const page=await pdf.getPage(p), content=await page.getTextContent();
+    for(const row of groupRows(content.items)){
+      if(p===1)debugRows.push(row.items.map(i=>i.text).join(' | '));
+      const d=matchRowDate(row.items); if(!d)continue;
+      const a=matchRowAmount(row.items,d.end); if(!a)continue;
+      const desc=row.items.slice(d.end,a.start).map(i=>i.text)
+        .filter(t=>t!=='-'&&t!=='•'&&!/\$/.test(t)&&!AMT_NUM.test(t))
+        .join(' ').replace(/\s+/g,' ').trim();
+      if(!desc)continue;
+      const isCredit=a.text.trim().startsWith('+');
+      const val=parseBRL(a.text.replace(/[^0-9.,]/g,'')); if(!val)continue;
+      const key=d.text+desc+a.text; if(seen.has(key))continue; seen.add(key);
+      txs.push({date:d.text,desc,category:isCredit?'💳 Pagamento':categorize(desc),amount:isCredit?val:-val,isCredit});
+    }
+  }
+  if(!txs.length)console.warn('Nenhuma transação reconhecida. Linhas da 1ª página:\n'+debugRows.join('\n'));
   return txs;
 }
 
 window.handleFile = async file => {
-  if(!file||!file.name.endsWith('.pdf')){ showPdfStatus('error','❌ Selecione um arquivo PDF.'); return; }
+  if(!file||!(file.name.toLowerCase().endsWith('.pdf')||file.type==='application/pdf')){ showPdfStatus('error','❌ Selecione um arquivo PDF.'); return; }
   showPdfStatus('loading',`Lendo ${file.name}…`);
   try{
-    const tx=await extractTransactions(new Uint8Array(await file.arrayBuffer()));
+    const tx=await extractTransactions(await file.arrayBuffer());
     const spending=tx.filter(t=>!t.isCredit);
-    if(!spending.length){ showPdfStatus('error','⚠️ Nenhuma transação encontrada.'); return; }
+    if(!tx.length){ showPdfStatus('error','⚠️ Nenhuma transação encontrada. Confira se o arquivo é a <strong>fatura do cartão Inter</strong> (não o extrato da conta). Se for a fatura mesmo, abra o console do navegador (F12) e me mande o que aparecer lá.'); return; }
+    if(!spending.length){ showPdfStatus('error','⚠️ Encontrei apenas pagamentos/estornos, nenhuma compra para importar.'); return; }
     document.getElementById('pdfStatus').style.display='none';
     _pendingTx=spending;
     showReviewPanel(spending,file.name);
